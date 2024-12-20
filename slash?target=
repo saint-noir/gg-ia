@@ -1,0 +1,344 @@
+from flask import Flask, request, Response, redirect, stream_with_context, jsonify, session
+import requests
+from urllib.parse import urljoin, urlparse, unquote
+import re
+import logging
+import html
+from werkzeug.datastructures import Headers
+from werkzeug.exceptions import HTTPException
+import traceback
+import base64
+
+app = Flask(__name__)
+app.secret_key = 'YOUR_SECRET_KEY'  # **Important: Replace with a very strong, random secret key**
+
+# --- Configuration ---
+PROXY_HOST = '127.0.0.1'
+PROXY_PORT = 5000
+ALLOWED_HOSTS = []  # **Important: Explicitly define allowed origins in production**
+ALLOWED_REDIRECT_DOMAINS = ['localhost', '127.0.0.1']
+MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # Increased to 50 MB
+TIMEOUT = 20  # Increased timeout to 20 seconds
+
+# --- Logging (Improved) ---
+logging.basicConfig(level=logging.DEBUG,  # Set to DEBUG for detailed output
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Debugging Mode ---
+DEBUG_MODE = True  # **Important: Set to False in production**
+
+# --- Fallbacks ---
+FALLBACK_URL = "/fallback"
+
+# --- Secure Headers ---
+SECURE_HEADERS = {
+    'X-Frame-Options': 'DENY',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * data:; font-src * data:; frame-ancestors 'none';",
+    'Referrer-Policy': 'no-referrer-when-downgrade',
+    'Permissions-Policy': 'interest-cohort=()'
+}
+
+# --- Error Handling ---
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Handles exceptions, logs them (with debug info to terminal), and provides a fallback."""
+    if isinstance(e, HTTPException):
+        return e  # Known HTTP errors are returned directly
+
+    logger.error(f"Unhandled Exception: {e}\n{traceback.format_exc()}")
+
+    if DEBUG_MODE:
+        # Detailed error response in debug mode (printed to terminal as well)
+        error_details = {
+            'error': 'Internal Server Error',
+            'message': str(e),
+            'traceback': traceback.format_exc()
+        }
+        print(error_details)  # Print to terminal for debugging
+        return jsonify(error_details), 500
+    else:
+        # Generic error and redirect to fallback in production
+        return redirect(FALLBACK_URL)
+
+@app.route(FALLBACK_URL)
+def fallback_page():
+    """Simple fallback page."""
+    return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Oops! Something went wrong.</title>
+        </head>
+        <body>
+            <h1>Something went wrong.</h1>
+            <p>We're working on it. Please try again later.</p>
+        </body>
+        </html>
+    """, 500, SECURE_HEADERS
+
+# --- Helper Functions ---
+
+def is_safe_redirect(target, requesting_host):
+    """Ensures redirects are safe (to allowed domains or same origin)."""
+    try:
+        parsed_target = urlparse(target)
+        is_safe = (
+            parsed_target.netloc in ALLOWED_REDIRECT_DOMAINS or
+            parsed_target.netloc == requesting_host
+        )
+        if not is_safe:
+            logger.warning(f"Unsafe redirect blocked: {target} (Requesting host: {requesting_host})")
+        return is_safe
+    except Exception as e:
+        logger.error(f"Error parsing redirect URL: {target}, Error: {e}")
+        return False
+
+def rewrite_content(content, base_url, proxy_url, content_type):
+    """Rewrites URLs in HTML, CSS, and JS content (more robust)."""
+
+    def rewrite_url_in_text(text):
+        """Rewrites URLs found within a larger text string."""
+        return re.sub(
+            r'(https?://)([^/"]+)(/[^"\s]*)?',
+            lambda match: rewrite_url(match.group(0), base_url, proxy_url),
+            text
+        )
+
+    if 'text/html' in content_type:
+        # More comprehensive HTML rewriting (handles more attribute variations)
+        content = re.sub(
+            r'(<.*? (?:href|src|action|data)=["\'])(?!#)(?!data:)([^"\'>]+)(["\'].*?>)',
+            lambda match: f'{match.group(1)}{rewrite_url(match.group(2), base_url, proxy_url)}{match.group(3)}',
+            content,
+            flags=re.IGNORECASE
+        )
+        # Inline style rewriting
+        content = re.sub(
+            r'(<[^>]+ style=["\'])(.*?)("[\'].*?>)',
+            lambda match: f'{match.group(1)}{rewrite_style_urls(match.group(2), base_url, proxy_url)}{match.group(3)}',
+            content,
+            flags=re.IGNORECASE
+        )
+        # Script tag content rewriting
+        content = re.sub(
+            r'(<script[^>]*>)(.*?)(</script>)',
+            lambda match: f'{match.group(1)}{rewrite_url_in_text(match.group(2))}{match.group(3)}',
+            content,
+            flags=re.IGNORECASE | re.DOTALL
+        )
+
+    elif 'text/css' in content_type or 'javascript' in content_type:
+        # Improved CSS and JS rewriting
+        content = re.sub(
+            r'(url\()(["\']?)(?!data:)([^)\s]+?)(\2\))',
+            lambda match: f'{match.group(1)}{match.group(2)}{rewrite_url(match.group(3), base_url, proxy_url)}{match.group(2)}{match.group(4)}',
+            content,
+            flags=re.IGNORECASE
+        )
+    
+    return content
+
+def rewrite_style_urls(style_content, base_url, proxy_url):
+    """Rewrites URLs within CSS style attributes."""
+    return re.sub(
+        r'(url\()(["\']?)(?!data:)([^)\s]+?)(\2\))',
+        lambda match: f'{match.group(1)}{match.group(2)}{rewrite_url(match.group(3), base_url, proxy_url)}{match.group(2)}{match.group(4)}',
+        style_content,
+        flags=re.IGNORECASE
+    )
+
+def rewrite_url(url, base_url, proxy_url):
+    """Rewrites a single URL to its proxied equivalent."""
+    # Decode the URL if it's already URL-encoded
+    decoded_url = unquote(url)
+
+    # Construct the absolute URL
+    absolute_url = urljoin(base_url, decoded_url)
+
+    # Check if the URL is a special 'about:' URL
+    if absolute_url.startswith('about:'):
+        return absolute_url
+
+    # Encode the absolute URL for proxying
+    encoded_absolute_url = f'{proxy_url}?url={html.escape(absolute_url)}'
+
+    # Additional debugging to log the original and rewritten URLs
+    logger.debug(f"Original URL: {url}")
+    logger.debug(f"Rewritten URL: {encoded_absolute_url}")
+
+    return encoded_absolute_url
+
+def filter_headers(headers, allowed):
+    """Filters headers, keeping only the allowed ones."""
+    filtered_headers = Headers()
+    for name, value in headers.items():
+        if name.lower() in allowed:
+            filtered_headers.add(name, value)
+    return filtered_headers
+
+# --- Proxy Route ---
+
+@app.route('/proxy')
+def proxy():
+    target_url = request.args.get('url')
+    logger.debug(f"Requested URL: {target_url}")
+
+    if not target_url:
+        return jsonify({'error': 'Missing "url" parameter.'}), 400
+
+    try:
+        with requests.Session() as session:
+            # Restore cookies from the Flask session
+            if 'cookies' in session:
+                session.cookies.update(session['cookies'])
+                logger.debug(f"Restored cookies: {session['cookies']}")
+
+            headers = filter_headers(request.headers,['accept','accept-encoding','accept-language','cache-control','connection','cookie','dnt','host','referer','upgrade-insecure-requests','user-agent'])
+
+            # Set a Referer header if it's not already set (some websites require it)
+            if 'Referer' not in headers and 'referer' not in headers:
+                headers['Referer'] = target_url
+
+            # Handle POST requests (for forms and authentication)
+            if request.method == 'POST':
+                # Pass form data directly
+                form_data = request.form
+                if form_data:
+                    logger.debug(f"POST Data: {form_data}")
+                else:
+                    logger.debug("No POST data found")
+
+                response = session.post(
+                    target_url,
+                    headers=headers,
+                    data=form_data,  # Pass form data to target
+                    stream=True,
+                    allow_redirects=False,
+                    verify=False,  # **Important: Consider removing in production if you can handle SSL certs**
+                    timeout=TIMEOUT
+                )
+            # Handle GET requests
+            else:
+                response = session.get(
+                    target_url,
+                    headers=headers,
+                    stream=True,
+                    allow_redirects=False,
+                    verify=False,  # **Important: Consider removing in production if you can handle SSL certs**
+                    timeout=TIMEOUT
+                )
+            
+            # Store cookies in the Flask session for subsequent requests
+            session['cookies'] = session.cookies.get_dict()
+            logger.debug(f"Stored cookies: {session['cookies']}")
+            
+            # Handle Redirects Securely
+            if response.is_redirect:
+                redirect_location = response.headers.get('Location')
+                if redirect_location and is_safe_redirect(redirect_location, request.host):
+                    logger.debug(f"Redirecting to: {redirect_location}")
+                    return redirect(f'/proxy?url={html.escape(redirect_location)}')
+                else:
+                    logger.warning(f"Unsafe redirect blocked: {redirect_location}")
+                    return jsonify({'error': 'Unsafe redirect destination.'}), 400
+
+            # Check Content Length
+            if 'Content-Length' in response.headers and int(response.headers['Content-Length']) > MAX_CONTENT_LENGTH:
+                logger.error("Content too large to proxy.")
+                return jsonify({'error': 'Content too large to proxy.'}), 413
+
+            content_type = response.headers.get('Content-Type', '')
+
+            # Rewrite Content (only for text-based content)
+            if any(ct in content_type for ct in ['text/html', 'text/css', 'javascript']):
+                def generate():
+                    proxy_url = f'http://{PROXY_HOST}:{PROXY_PORT}/proxy'
+                    buffer = ""
+                    for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+                        buffer += chunk
+                        if len(buffer) >= 8192:
+                            rewritten_content = rewrite_content(buffer, target_url, proxy_url, content_type)
+                            logger.debug(f"Rewriting content: {rewritten_content[:100]}...")  # Log a snippet
+                            yield rewritten_content
+                            buffer = ""
+                    if buffer:
+                        rewritten_content = rewrite_content(buffer, target_url, proxy_url, content_type)
+                        logger.debug(f"Rewriting content: {rewritten_content[:100]}...")  # Log a snippet
+                        yield rewritten_content
+
+                response_content = generate()
+            # Stream Binary Content Directly
+            else:
+                def stream_binary_content():
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            yield chunk
+
+                response_content = stream_binary_content()
+
+            # Create Flask Response with Streamed Content
+            resp = Response(stream_with_context(response_content), status=response.status_code)
+
+            # Filter and Set Response Headers
+            allowed_response_headers = [
+                'content-type', 'content-length', 'date', 'expires', 'cache-control',
+                'last-modified', 'etag', 'content-encoding', 'vary', 'location', 'set-cookie'
+            ]
+            resp.headers = filter_headers(response.headers, allowed_response_headers)
+
+            # Handle Set-Cookie header securely
+            if 'Set-Cookie' in resp.headers:
+                cookies = resp.headers.getlist('Set-Cookie')
+                resp.headers.delete('Set-Cookie')
+                for cookie in cookies:
+                    # Set Secure and HttpOnly flags, and SameSite=None for broader compatibility
+                    resp.headers.add('Set-Cookie', cookie + '; Secure; HttpOnly; SameSite=None')
+
+            # Handle CORS
+            origin = request.headers.get('Origin')
+            if origin and origin in ALLOWED_HOSTS:
+                resp.headers['Access-Control-Allow-Origin'] = origin
+                resp.headers['Access-Control-Allow-Credentials'] = 'true'
+                resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
+                resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+
+            # Add Security Headers
+            for header, value in SECURE_HEADERS.items():
+                resp.headers[header] = value
+
+            return resp
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching URL: {target_url}, Error: {e}")
+        if DEBUG_MODE:
+            return jsonify({'error': f'Error fetching URL: {e}', 'traceback': traceback.format_exc()}), 500
+        else:
+            raise  # Re-raise to be handled by the global exception handler
+
+# --- Iframe Hosting Route ---
+
+@app.route('/')
+def index():
+    initial_url = request.args.get('target', 'https://www.example.com')
+    escaped_url = html.escape(initial_url)
+    return f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Local Web Proxy</title>
+            <style>
+                body, html {{ margin: 0; padding: 0; overflow: hidden; width: 100%; height: 100%; }}
+                iframe {{ display: block; width: 100%; height: 100%; border: none; }}
+            </style>
+        </head>
+        <body>
+            <iframe src="/proxy?url={escaped_url}" allow="microphone *; camera *"></iframe>
+        </body>
+        </html>
+    """, 200, SECURE_HEADERS
+
+if __name__ == '__main__':
+    app.run(host=PROXY_HOST, port=PROXY_PORT, debug=DEBUG_MODE)
